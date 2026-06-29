@@ -4,17 +4,52 @@ import { MihomoWebSocket } from 'tauri-plugin-mihomo-api'
 const MAX_CLOSED_CONNS_NUM = 500
 const CONNECTION_UPDATE_THROTTLE_MS = 500
 const CONNECTION_RECONNECT_DELAY_MS = 1_000
+const UNKNOWN_HOST = '未知主机'
+const UNKNOWN_GROUP = '未知分组'
 
 type ConnectionMetadata = IConnectionsItem['metadata']
 type ConnectionListener = () => void
 
+type ConnectionAggregateInput = {
+  connection: IConnectionsItem
+  previous?: IConnectionsItem
+}
+
 const metadataValue = (value?: string) => value || ''
+const cleanText = (value?: string) => (value || '').trim()
+const normalizeGroup = (value?: string) => cleanText(value) || UNKNOWN_GROUP
+
+const addUniqueText = (target: string[], value?: string) => {
+  const nextValue = cleanText(value)
+  if (!nextValue || target.includes(nextValue)) return
+  target.push(nextValue)
+}
 
 export const initConnData: ConnectionMonitorData = {
   uploadTotal: 0,
   downloadTotal: 0,
   activeConnections: [],
   closedConnections: [],
+  aggregatedConnections: [],
+}
+
+export interface ConnectionAggregateItem {
+  id: string
+  host: string
+  topGroup: string
+  groups: string[]
+  upload: number
+  download: number
+  curUpload: number
+  curDownload: number
+  activeCount: number
+  closedCount: number
+  connectionCount: number
+  chains: string[]
+  rules: string[]
+  processes: string[]
+  firstSeen: number
+  lastSeen: number
 }
 
 export interface ConnectionMonitorData {
@@ -22,6 +57,7 @@ export interface ConnectionMonitorData {
   downloadTotal: number
   activeConnections: IConnectionsItem[]
   closedConnections: IConnectionsItem[]
+  aggregatedConnections: ConnectionAggregateItem[]
 }
 
 export interface ConnectionSummaryData {
@@ -44,6 +80,8 @@ let lastFlushAt = 0
 
 const connectionListeners = new Set<ConnectionListener>()
 const summaryListeners = new Set<ConnectionListener>()
+const aggregateByKey = new Map<string, ConnectionAggregateItem>()
+const aggregateActiveKeysById = new Map<string, string>()
 
 const notifyConnectionListeners = () => {
   connectionListeners.forEach((listener) => listener())
@@ -143,6 +181,183 @@ const normalizeConnection = (
   }
 }
 
+const getAggregateHost = (connection: IConnectionsItem) => {
+  const { metadata } = connection
+  const host =
+    cleanText(metadata.host) ||
+    cleanText(metadata.remoteDestination) ||
+    cleanText(metadata.destinationIP) ||
+    UNKNOWN_HOST
+  const port = cleanText(metadata.destinationPort)
+  return port ? `${host}:${port}` : host
+}
+
+const getAggregateTopGroup = (chains: string[]) =>
+  normalizeGroup(chains.length > 0 ? chains[chains.length - 1] : undefined)
+
+const getAggregateGroups = (chains: string[]) => {
+  const groups: string[] = []
+  for (let i = chains.length - 1; i >= 0; i--) {
+    const group = normalizeGroup(chains[i])
+    if (!groups.includes(group)) groups.push(group)
+  }
+  if (groups.length === 0) groups.push(UNKNOWN_GROUP)
+  return groups
+}
+
+const getAggregateKey = (connection: IConnectionsItem) => {
+  const hostKey = getAggregateHost(connection).toLowerCase()
+  const topGroup = getAggregateTopGroup(connection.chains || [])
+  return `${hostKey}|${topGroup}`
+}
+
+const getConnectionRuleText = (connection: IConnectionsItem) => {
+  const rule = cleanText(connection.rule)
+  const rulePayload = cleanText(connection.rulePayload)
+  if (rule && rulePayload) return `${rule}(${rulePayload})`
+  return rule || rulePayload
+}
+
+const getConnectionProcessText = (connection: IConnectionsItem) => {
+  const { metadata } = connection
+  return cleanText(metadata.process) || cleanText(metadata.processPath)
+}
+
+const createAggregateItem = (
+  key: string,
+  connection: IConnectionsItem,
+  now: number,
+): ConnectionAggregateItem => {
+  const chains = connection.chains || []
+  const item: ConnectionAggregateItem = {
+    id: key,
+    host: getAggregateHost(connection),
+    topGroup: getAggregateTopGroup(chains),
+    groups: getAggregateGroups(chains),
+    upload: 0,
+    download: 0,
+    curUpload: 0,
+    curDownload: 0,
+    activeCount: 0,
+    closedCount: 0,
+    connectionCount: 0,
+    chains: chains.slice(),
+    rules: [],
+    processes: [],
+    firstSeen: now,
+    lastSeen: now,
+  }
+  addUniqueText(item.rules, getConnectionRuleText(connection))
+  addUniqueText(item.processes, getConnectionProcessText(connection))
+  return item
+}
+
+const ensureAggregateItem = (
+  key: string,
+  connection: IConnectionsItem,
+  now: number,
+) => {
+  const item = aggregateByKey.get(key)
+  if (item) return item
+
+  const nextItem = createAggregateItem(key, connection, now)
+  aggregateByKey.set(key, nextItem)
+  return nextItem
+}
+
+const updateAggregateItemMetadata = (
+  item: ConnectionAggregateItem,
+  connection: IConnectionsItem,
+  now: number,
+) => {
+  const chains = connection.chains || []
+  item.host = getAggregateHost(connection)
+  item.topGroup = getAggregateTopGroup(chains)
+  getAggregateGroups(chains).forEach((group) => addUniqueText(item.groups, group))
+  item.chains = chains.slice()
+  addUniqueText(item.rules, getConnectionRuleText(connection))
+  addUniqueText(item.processes, getConnectionProcessText(connection))
+  item.lastSeen = now
+}
+
+const decrementAggregateActiveCount = (key: string) => {
+  const item = aggregateByKey.get(key)
+  if (!item) return
+  item.activeCount = Math.max(0, item.activeCount - 1)
+}
+
+const closeAggregateConnection = (connectionId: string, now: number) => {
+  const key = aggregateActiveKeysById.get(connectionId)
+  if (!key) return
+
+  const item = aggregateByKey.get(key)
+  if (item) {
+    item.activeCount = Math.max(0, item.activeCount - 1)
+    item.closedCount += 1
+    item.lastSeen = now
+  }
+  aggregateActiveKeysById.delete(connectionId)
+}
+
+const createAggregateSnapshot = () =>
+  Array.from(aggregateByKey.values()).map((item) => ({
+    ...item,
+    groups: item.groups.slice(),
+    chains: item.chains.slice(),
+    rules: item.rules.slice(),
+    processes: item.processes.slice(),
+  }))
+
+const mergeConnectionAggregates = (
+  activeInputs: ConnectionAggregateInput[],
+  removedConnections: Map<string, IConnectionsItem>,
+) => {
+  const now = Date.now()
+
+  aggregateByKey.forEach((item) => {
+    item.curUpload = 0
+    item.curDownload = 0
+  })
+
+  for (let i = 0; i < activeInputs.length; i++) {
+    const { connection, previous } = activeInputs[i]
+    const key = getAggregateKey(connection)
+    const item = ensureAggregateItem(key, connection, now)
+    const previousKey = aggregateActiveKeysById.get(connection.id)
+
+    if (previousKey !== key) {
+      if (previousKey) decrementAggregateActiveCount(previousKey)
+      aggregateActiveKeysById.set(connection.id, key)
+      item.activeCount += 1
+      item.connectionCount += 1
+    }
+
+    const upload = connection.upload ?? 0
+    const download = connection.download ?? 0
+    const deltaUpload = previous
+      ? Math.max(0, upload - (previous.upload ?? 0))
+      : upload
+    const deltaDownload = previous
+      ? Math.max(0, download - (previous.download ?? 0))
+      : download
+
+    if (deltaUpload > 0 || deltaDownload > 0) {
+      item.upload += deltaUpload
+      item.download += deltaDownload
+      item.curUpload += deltaUpload
+      item.curDownload += deltaDownload
+    }
+
+    updateAggregateItemMetadata(item, connection, now)
+  }
+
+  removedConnections.forEach((connection) => {
+    closeAggregateConnection(connection.id, now)
+  })
+
+  return createAggregateSnapshot()
+}
+
 const mergeConnectionSnapshot = (
   payload: IConnections,
   previous: ConnectionMonitorData = initConnData,
@@ -158,12 +373,23 @@ const mergeConnectionSnapshot = (
   }
 
   const activeConnections: IConnectionsItem[] = []
+  const activeAggregateInputs: ConnectionAggregateInput[] = []
   for (let i = 0; i < nextConnections.length; i++) {
     const connection = nextConnections[i]
     const previousConnection = previousActiveById.get(connection.id)
     if (previousConnection) previousActiveById.delete(connection.id)
-    activeConnections.push(normalizeConnection(connection, previousConnection))
+    const normalizedConnection = normalizeConnection(connection, previousConnection)
+    activeConnections.push(normalizedConnection)
+    activeAggregateInputs.push({
+      connection: normalizedConnection,
+      previous: previousConnection,
+    })
   }
+
+  const aggregatedConnections = mergeConnectionAggregates(
+    activeAggregateInputs,
+    previousActiveById,
+  )
 
   if (previousActiveById.size === 0) {
     return {
@@ -171,6 +397,7 @@ const mergeConnectionSnapshot = (
       downloadTotal: payload.downloadTotal ?? 0,
       activeConnections,
       closedConnections: previousClosed,
+      aggregatedConnections,
     }
   }
 
@@ -202,6 +429,7 @@ const mergeConnectionSnapshot = (
     downloadTotal: payload.downloadTotal ?? 0,
     activeConnections,
     closedConnections,
+    aggregatedConnections,
   }
 }
 
@@ -229,10 +457,8 @@ const flushPendingMessage = () => {
   connectionSummary = mergeConnectionSummary(payload)
   notifySummaryListeners()
 
-  if (connectionListeners.size === 0) return
-
   connectionData = mergeConnectionSnapshot(payload, connectionData)
-  notifyConnectionListeners()
+  if (connectionListeners.size > 0) notifyConnectionListeners()
 }
 
 const enqueueConnectionMessage = (messageData: string) => {
@@ -351,6 +577,52 @@ const clearClosedConnectionData = () => {
   notifyConnectionListeners()
 }
 
+const clearAggregateConnectionData = () => {
+  if (aggregateByKey.size === 0 && aggregateActiveKeysById.size === 0) return
+  aggregateByKey.clear()
+  aggregateActiveKeysById.clear()
+  connectionData = {
+    ...connectionData,
+    aggregatedConnections: [],
+  }
+  notifyConnectionListeners()
+}
+
+const clearAggregateConnectionById = (id: string) => {
+  if (!aggregateByKey.has(id)) return
+  aggregateByKey.delete(id)
+  aggregateActiveKeysById.forEach((key, connectionId) => {
+    if (key === id) aggregateActiveKeysById.delete(connectionId)
+  })
+  connectionData = {
+    ...connectionData,
+    aggregatedConnections: createAggregateSnapshot(),
+  }
+  notifyConnectionListeners()
+}
+
+const clearAggregateConnectionsByGroups = (groups: string[]) => {
+  const groupSet = new Set(groups.map((group) => cleanText(group)).filter(Boolean))
+  if (groupSet.size === 0) return
+
+  const keysToDelete = new Set<string>()
+  aggregateByKey.forEach((item, key) => {
+    if (item.groups.some((group) => groupSet.has(group))) keysToDelete.add(key)
+  })
+
+  if (keysToDelete.size === 0) return
+
+  keysToDelete.forEach((key) => aggregateByKey.delete(key))
+  aggregateActiveKeysById.forEach((key, connectionId) => {
+    if (keysToDelete.has(key)) aggregateActiveKeysById.delete(connectionId)
+  })
+  connectionData = {
+    ...connectionData,
+    aggregatedConnections: createAggregateSnapshot(),
+  }
+  notifyConnectionListeners()
+}
+
 export const useConnectionData = () => {
   const data = useSyncExternalStore(
     subscribeConnectionData,
@@ -364,11 +636,23 @@ export const useConnectionData = () => {
   const clearClosedConnections = useCallback(() => {
     clearClosedConnectionData()
   }, [])
+  const clearAggregatedConnections = useCallback(() => {
+    clearAggregateConnectionData()
+  }, [])
+  const clearAggregatedConnection = useCallback((id: string) => {
+    clearAggregateConnectionById(id)
+  }, [])
+  const clearAggregatedConnectionsByGroups = useCallback((groups: string[]) => {
+    clearAggregateConnectionsByGroups(groups)
+  }, [])
 
   return {
     response,
     refreshGetClashConnection,
     clearClosedConnections,
+    clearAggregatedConnections,
+    clearAggregatedConnection,
+    clearAggregatedConnectionsByGroups,
   }
 }
 
