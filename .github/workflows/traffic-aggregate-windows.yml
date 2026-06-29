@@ -1,0 +1,80 @@
+name: Traffic Aggregate Windows Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or commit to build'
+        required: true
+        default: 'traffic-aggregate-memory'
+        type: string
+  push:
+    branches:
+      - traffic-aggregate-memory
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+  HUSKY: 0
+
+jobs:
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Add Rust Target
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.18.0'
+          cache: pnpm
+
+      - name: Install dependencies and prepare sidecars
+        run: |
+          pnpm i
+          pnpm run prebuild x86_64-pc-windows-msvc
+
+      - name: Disable updater artifacts for unsigned custom build
+        shell: pwsh
+        run: |
+          $tauriPath = "src-tauri/tauri.conf.json"
+          $tauri = Get-Content $tauriPath -Raw | ConvertFrom-Json
+          $tauri.version = "2.5.2-traffic.1"
+          $tauri.bundle.createUpdaterArtifacts = $false
+          $tauri | ConvertTo-Json -Depth 100 | Set-Content $tauriPath -Encoding utf8
+
+          $pkgPath = "package.json"
+          $pkg = Get-Content $pkgPath -Raw | ConvertFrom-Json
+          $pkg.version = "2.5.2-traffic.1"
+          $pkg | ConvertTo-Json -Depth 100 | Set-Content $pkgPath -Encoding utf8
+
+      - name: Tauri build
+        env:
+          NODE_OPTIONS: --max_old_space_size=4096
+        run: pnpm tauri build --target x86_64-pc-windows-msvc -b nsis
+
+      - name: Upload Windows x64 installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: clash-verge-traffic-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
