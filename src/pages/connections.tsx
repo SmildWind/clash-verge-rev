@@ -413,7 +413,6 @@ const ConnectionsPage = () => {
               onChange={handleAggregateGroupChange}
               renderValue={renderAggregateGroupValue}
               sx={{ width: 220, height: 33.375, flex: '0 0 auto' }}
-              MenuProps={{ PaperProps: { sx: { maxHeight: 420 } } }}
             >
               <MenuItem value={SELECT_ALL_GROUPS_VALUE}>
                 <Checkbox
