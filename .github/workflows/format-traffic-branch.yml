@@ -1,21 +1,26 @@
 name: Format Traffic Branch
 
 on:
-  push:
+  pull_request_target:
     branches:
-      - traffic-aggregate-memory
+      - dev
+    types:
+      - opened
+      - synchronize
 
 permissions:
   contents: write
 
 jobs:
   format:
+    if: github.event.pull_request.head.ref == 'traffic-aggregate-memory' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Checkout traffic branch
         uses: actions/checkout@v7
         with:
           ref: traffic-aggregate-memory
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
