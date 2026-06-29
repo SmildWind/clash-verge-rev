@@ -1,6 +1,9 @@
 name: Format Traffic Branch
 
 on:
+  push:
+    branches:
+      - traffic-aggregate-memory
   pull_request_target:
     branches:
       - dev
@@ -13,7 +16,10 @@ permissions:
 
 jobs:
   format:
-    if: github.event.pull_request.head.ref == 'traffic-aggregate-memory' && github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.head.ref == 'traffic-aggregate-memory' &&
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout traffic branch
